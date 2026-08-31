@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import fcm_sender
+
 
 BASE = Path.home() / ".hermes" / "personal-admin"
 DB_FILE = BASE / "personal_admin.db"
@@ -29,6 +31,9 @@ PRIORITIES = {
     "important": 4,
     "urgent": 5,
 }
+
+ACTIVE_TRANSPORT = "ntfy"
+SUPPORTED_TRANSPORTS = frozenset({"ntfy", "fcm"})
 
 
 def now():
@@ -279,7 +284,20 @@ def publish(row):
         )
 
 
+def validate_active_transport():
+    if ACTIVE_TRANSPORT not in SUPPORTED_TRANSPORTS:
+        raise ValueError("unsupported active transport")
+
+
+def send_transport(row):
+    validate_active_transport()
+    if ACTIVE_TRANSPORT == "ntfy":
+        return publish(row)
+    return fcm_sender.send_notification(row)
+
+
 def cmd_dispatch(args):
+    validate_active_transport()
     conn = connect()
     init_db(conn)
 
@@ -303,25 +321,62 @@ def cmd_dispatch(args):
         attempt_time = now()
 
         try:
-            result = publish(row)
+            result = send_transport(row)
 
-            conn.execute(
-                """
-                UPDATE notifications
-                SET sent_at = ?,
-                    ntfy_message_id = ?,
-                    send_attempts = send_attempts + 1,
-                    last_attempt_at = ?,
-                    last_error = NULL
-                WHERE notification_id = ?
-                """,
-                (
-                    now(),
-                    result.get("id"),
-                    attempt_time,
-                    row["notification_id"],
-                ),
-            )
+            if ACTIVE_TRANSPORT == "fcm":
+                if not result.accepted:
+                    conn.execute(
+                        """
+                        UPDATE notifications
+                        SET send_attempts = send_attempts + 1,
+                            last_attempt_at = ?,
+                            last_error = ?
+                        WHERE notification_id = ?
+                        """,
+                        (
+                            attempt_time,
+                            fcm_sender.sanitized_error_marker(result)
+                            or "FCM_UNKNOWN:unknown",
+                            row["notification_id"],
+                        ),
+                    )
+                    conn.commit()
+                    failed += 1
+                    continue
+
+                conn.execute(
+                    """
+                    UPDATE notifications
+                    SET sent_at = ?,
+                        send_attempts = send_attempts + 1,
+                        last_attempt_at = ?,
+                        last_error = NULL
+                    WHERE notification_id = ?
+                    """,
+                    (
+                        now(),
+                        attempt_time,
+                        row["notification_id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE notifications
+                    SET sent_at = ?,
+                        ntfy_message_id = ?,
+                        send_attempts = send_attempts + 1,
+                        last_attempt_at = ?,
+                        last_error = NULL
+                    WHERE notification_id = ?
+                    """,
+                    (
+                        now(),
+                        result.get("id"),
+                        attempt_time,
+                        row["notification_id"],
+                    ),
+                )
 
             conn.commit()
             sent += 1
@@ -337,7 +392,11 @@ def cmd_dispatch(args):
                 """,
                 (
                     attempt_time,
-                    str(exc)[:2000],
+                    (
+                        "FCM_UNKNOWN:unknown"
+                        if ACTIVE_TRANSPORT == "fcm"
+                        else str(exc)[:2000]
+                    ),
                     row["notification_id"],
                 ),
             )
