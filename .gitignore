@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+personal_admin.db
+personal_admin.db-wal
+personal_admin.db-shm
+personal_admin.db-*
+
+ntfy/publisher_token
