@@ -32,7 +32,7 @@ PRIORITIES = {
     "urgent": 5,
 }
 
-ACTIVE_TRANSPORT = "ntfy"
+ACTIVE_TRANSPORT = "fcm"
 SUPPORTED_TRANSPORTS = frozenset({"ntfy", "fcm"})
 
 
