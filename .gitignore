@@ -9,3 +9,10 @@ personal_admin.db-shm
 personal_admin.db-*
 
 ntfy/publisher_token
+
+# Local/runtime Hermes state
+.venv-py39-backup/
+*.pid
+google/
+logs/
+ntfy/
