@@ -905,7 +905,7 @@ class RecoveryServerTest(unittest.TestCase):
             "load_key_file",
             side_effect=fail_key_load,
         ):
-            status, body, raw, _ = self._get_recovery_raw(
+            status, body, raw, cache_control = self._get_recovery_raw(
                 headers={"Tailscale-User-Login": "user@example.com"}
             )
 
@@ -913,6 +913,7 @@ class RecoveryServerTest(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertEqual("internal recovery failure", body["error"])
         self.assertNotIn("items", body)
+        self.assertEqual("no-store", cache_control)
         self.assertNotIn(sentinel_title, raw)
         self.assertNotIn(sentinel_message, raw)
         self.assertNotIn(sentinel_token, raw)
@@ -1021,6 +1022,168 @@ class RecoveryServerTest(unittest.TestCase):
         self.assertEqual(1, len(body["items"]))
         inner = self._decrypt_envelope(body["items"][0])
         self.assertEqual("notif-025-ok", inner["notification_id"])
+
+    def test_missing_recovery_db_returns_500_sanitized_no_abort(self):
+        """Test A: a missing recovery DB returns the existing sanitized 500
+        with Cache-Control: no-store and a complete response instead of
+        aborting the HTTP connection."""
+        missing_db = Path(self.directory.name) / "missing.db"
+        self.assertFalse(missing_db.exists())
+
+        with patch.object(
+            ack_server, "DB_FILE", missing_db
+        ):
+            conn = HTTPConnection("127.0.0.1", TEST_PORT)
+            conn.request(
+                "GET",
+                "/notifications/pending",
+                headers={
+                    "Host": "127.0.0.1:2587",
+                    "Tailscale-User-Login":
+                        "user@example.com",
+                },
+            )
+            response = conn.getresponse()
+            status = response.status
+            raw = response.read().decode("utf-8")
+            cache_control = response.getheader("Cache-Control")
+            content_length = response.getheader("Content-Length")
+            conn.close()
+
+        self.assertEqual(500, status)
+        body = json.loads(raw)
+        self.assertFalse(body["ok"])
+        self.assertEqual("internal recovery failure", body["error"])
+        self.assertNotIn("items", body)
+        self.assertEqual("no-store", cache_control)
+        # The response completed: its declared length matches.
+        self.assertEqual(len(raw.encode("utf-8")), int(content_length))
+        self.assertNotIn("unable to open", raw)
+        self.assertNotIn("missing.db", raw)
+
+        # The failure was answered, not aborted: the server stays usable.
+        status2, body2 = self._get_health()
+        self.assertEqual(200, status2)
+        self.assertTrue(body2["ok"])
+
+    def test_unopenable_recovery_db_returns_500_sanitized(self):
+        """Test A2: an unopenable recovery DB path (a directory) returns the
+        sanitized 500 with Cache-Control: no-store."""
+        with patch.object(
+            ack_server, "DB_FILE", self.directory.name
+        ):
+            status, body, raw, cache_control = self._get_recovery_raw(
+                headers={"Tailscale-User-Login": "user@example.com"}
+            )
+
+        self.assertEqual(500, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("internal recovery failure", body["error"])
+        self.assertNotIn("items", body)
+        self.assertEqual("no-store", cache_control)
+        self.assertNotIn("I/O error", raw)
+
+    def test_recovery_select_failure_returns_500_no_leak_no_abort(self):
+        """Test B: a DB that opens but whose recovery SELECT fails returns
+        the sanitized 500.  The real read-only connection is used, so no
+        exception/private detail can leak and the connection stays usable."""
+        broken_db = Path(self.directory.name) / "select-fail.db"
+        sqlite3.connect(str(broken_db)).close()
+
+        with patch.object(
+            ack_server, "DB_FILE", broken_db
+        ):
+            status, body, raw, cache_control = self._get_recovery_raw(
+                headers={"Tailscale-User-Login": "user@example.com"}
+            )
+
+        self.assertEqual(500, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("internal recovery failure", body["error"])
+        self.assertNotIn("items", body)
+        self.assertEqual("no-store", cache_control)
+        self.assertNotIn("no such table", raw)
+        self.assertNotIn("OperationalError", raw)
+        self.assertNotIn("sqlite3", raw)
+        self.assertNotIn("Traceback", raw)
+
+        status2, body2 = self._get_health()
+        self.assertEqual(200, status2)
+        self.assertTrue(body2["ok"])
+
+    def test_read_only_connection_closed_when_query_fails(self):
+        """Test B2: the read-only connection is always closed once opened,
+        including when the SELECT/fetch raises inside the handler."""
+        class FailingConnection:
+            def __init__(self):
+                self.closed = False
+
+            def execute(self, *args, **kwargs):
+                raise sqlite3.OperationalError("boom")
+
+            def close(self):
+                self.closed = True
+
+        failing = FailingConnection()
+
+        with patch.object(
+            ack_server,
+            "connect_read_only",
+            return_value=failing,
+        ):
+            status, body = self._get_recovery(
+                headers={"Tailscale-User-Login": "user@example.com"}
+            )
+
+        self.assertEqual(500, status)
+        self.assertFalse(body["ok"])
+        self.assertEqual("internal recovery failure", body["error"])
+        self.assertTrue(failing.closed)
+        self.assertNotIn("boom", body["error"])
+
+    def test_key_loaded_once_per_recovery_request(self):
+        """Test D: multiple recovered rows load the AES key exactly once per
+        request, and every envelope decrypts with that same key."""
+        db_conn = sqlite3.connect(self.db_file)
+        db_conn.row_factory = sqlite3.Row
+        _insert_run(db_conn, "run-001", "committed")
+        for i in range(3):
+            _insert_notification(
+                db_conn,
+                f"notif-key-{i}",
+                created_at=f"2026-09-01T00:0{i}:00Z",
+            )
+        db_conn.close()
+
+        calls = []
+
+        def counting_load(path=None):
+            calls.append(path)
+            return TEST_KEY
+
+        with patch.object(
+            fcm_sender,
+            "load_key_file",
+            side_effect=counting_load,
+        ):
+            status, body = self._get_recovery(
+                headers={"Tailscale-User-Login": "user@example.com"}
+            )
+
+        self.assertEqual(200, status)
+        self.assertTrue(body["ok"])
+        self.assertEqual(3, body["count"])
+        self.assertEqual(3, len(body["items"]))
+        self.assertEqual(1, len(calls))
+
+        ids = set()
+        for item in body["items"]:
+            inner = self._decrypt_envelope(item)
+            ids.add(inner["notification_id"])
+        self.assertEqual(
+            {"notif-key-0", "notif-key-1", "notif-key-2"},
+            ids,
+        )
 
 
 if __name__ == "__main__":
