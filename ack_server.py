@@ -1,5 +1,6 @@
 #!/Users/eduardo/.hermes/personal-admin/.venv/bin/python
 
+import contextlib
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -135,30 +136,42 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
-        conn = connect_read_only()
-
-        rows = conn.execute(
-            """
-            SELECT n.notification_id,
-                   n.level,
-                   n.title,
-                   n.message,
-                   n.created_at,
-                   n.ack_token
-            FROM notifications n
-            JOIN runs r
-              ON r.run_id = n.run_id
-            WHERE n.canceled_at IS NULL
-              AND n.acknowledged_at IS NULL
-              AND r.status = 'committed'
-            ORDER BY n.created_at ASC,
-                     n.notification_id ASC
-            LIMIT ?
-            """,
-            (MAX_PENDING_RECOVERY_ITEMS + 1,),
-        ).fetchall()
-
-        conn.close()
+        # Any connect/query failure is answered with the same sanitized 500
+        # instead of aborting the HTTP connection, and the read-only
+        # connection is always closed once opened, including on failure.
+        try:
+            with contextlib.closing(
+                connect_read_only()
+            ) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT n.notification_id,
+                           n.level,
+                           n.title,
+                           n.message,
+                           n.created_at,
+                           n.ack_token
+                    FROM notifications n
+                    JOIN runs r
+                      ON r.run_id = n.run_id
+                    WHERE n.canceled_at IS NULL
+                      AND n.acknowledged_at IS NULL
+                      AND r.status = 'committed'
+                    ORDER BY n.created_at ASC,
+                             n.notification_id ASC
+                    LIMIT ?
+                    """,
+                    (MAX_PENDING_RECOVERY_ITEMS + 1,),
+                ).fetchall()
+        except Exception:
+            self.json_response(
+                500,
+                {
+                    "ok": False,
+                    "error": "internal recovery failure",
+                },
+            )
+            return
 
         if len(rows) > MAX_PENDING_RECOVERY_ITEMS:
             self.json_response(
@@ -170,10 +183,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        # Load the E2EE key exactly once for the batch; any key-load or
+        # envelope failure still yields the sanitized 500 with no partial
+        # success.  Details are never logged.
         items = []
-        for row in rows:
+        if rows:
             try:
-                envelope = fcm_sender.build_envelope(row)
+                key = fcm_sender.load_key_file()
+                for row in rows:
+                    items.append(
+                        fcm_sender.build_envelope(row, key=key)
+                    )
             except Exception:
                 self.json_response(
                     500,
@@ -183,7 +203,6 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            items.append(envelope)
 
         self.json_response(
             200,
