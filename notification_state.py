@@ -309,6 +309,7 @@ def cmd_dispatch(args):
           ON r.run_id = n.run_id
         WHERE n.sent_at IS NULL
           AND n.canceled_at IS NULL
+          AND n.acknowledged_at IS NULL
           AND r.status = 'committed'
         ORDER BY n.created_at
         """

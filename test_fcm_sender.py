@@ -258,6 +258,9 @@ class DispatcherTest(unittest.TestCase):
         notification_id,
         *,
         created_at,
+        acknowledged_at=None,
+        send_attempts=0,
+        last_attempt_at=None,
         last_error=None,
         ntfy_message_id=None,
     ):
@@ -267,8 +270,9 @@ class DispatcherTest(unittest.TestCase):
             INSERT INTO notifications(
                 notification_id, run_id, dedupe_key, level, title, message,
                 ack_token, ntfy_sequence_id, ntfy_message_id, created_at,
+                acknowledged_at, send_attempts, last_attempt_at,
                 last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 notification_id,
@@ -281,6 +285,9 @@ class DispatcherTest(unittest.TestCase):
                 "seq-" + notification_id,
                 ntfy_message_id,
                 created_at,
+                acknowledged_at,
+                send_attempts,
+                last_attempt_at,
                 last_error,
             ),
         )
@@ -333,6 +340,92 @@ class DispatcherTest(unittest.TestCase):
         self.assertIsNotNone(row["last_attempt_at"])
         self.assertIsNone(row["last_error"])
         self.assertIsNone(row["ntfy_message_id"])
+
+    def test_acknowledged_unsent_committed_row_is_not_dispatched(self):
+        self.add_row(
+            "ack-unsent-001",
+            created_at="2026-08-30T00:00:00Z",
+            acknowledged_at="2026-08-30T01:00:00Z",
+            send_attempts=0,
+            last_attempt_at=None,
+            last_error=None,
+        )
+
+        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
+            with patch.object(fcm_sender, "send_notification") as send:
+                notification_state.cmd_dispatch(None)
+
+        send.assert_not_called()
+        row = self.read_row("ack-unsent-001")
+        self.assertIsNone(row["sent_at"])
+        self.assertEqual(0, row["send_attempts"])
+        self.assertIsNone(row["last_attempt_at"])
+        self.assertIsNone(row["last_error"])
+        self.assertIsNotNone(row["acknowledged_at"])
+
+    def test_unacknowledged_unsent_committed_row_is_dispatched(self):
+        self.add_row("unack-unsent-001", created_at="2026-08-30T00:00:00Z")
+        observed = []
+
+        def fake_send(row):
+            observed.append(row["notification_id"])
+            return fcm_sender.TransportResult(
+                True,
+                "accepted",
+                message_id="m-1",
+            )
+
+        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
+            with patch.object(
+                fcm_sender,
+                "send_notification",
+                side_effect=fake_send,
+            ):
+                notification_state.cmd_dispatch(None)
+
+        row = self.read_row("unack-unsent-001")
+        self.assertEqual(["unack-unsent-001"], observed)
+        self.assertIsNotNone(row["sent_at"])
+        self.assertEqual(1, row["send_attempts"])
+        self.assertIsNone(row["last_error"])
+
+    def test_acknowledged_row_with_previous_failed_attempt_is_not_retried(self):
+        self.add_row(
+            "ack-failed-001",
+            created_at="2026-08-30T00:00:00Z",
+            acknowledged_at="2026-08-30T02:00:00Z",
+            send_attempts=3,
+            last_attempt_at="2026-08-30T03:00:00Z",
+            last_error="FCM_TRANSIENT:network",
+        )
+
+        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
+            with patch.object(fcm_sender, "send_notification") as send:
+                notification_state.cmd_dispatch(None)
+
+        send.assert_not_called()
+        row = self.read_row("ack-failed-001")
+        self.assertIsNone(row["sent_at"])
+        self.assertEqual(3, row["send_attempts"])
+        self.assertEqual("2026-08-30T03:00:00Z", row["last_attempt_at"])
+        self.assertEqual("FCM_TRANSIENT:network", row["last_error"])
+        self.assertIsNotNone(row["acknowledged_at"])
+
+    def test_ntfy_acknowledged_row_is_not_published(self):
+        self.add_row(
+            "ntfy-ack-001",
+            created_at="2026-08-30T00:00:00Z",
+            acknowledged_at="2026-08-30T01:00:00Z",
+        )
+
+        with patch.object(notification_state, "ACTIVE_TRANSPORT", "ntfy"):
+            with patch.object(notification_state, "publish") as publish:
+                notification_state.cmd_dispatch(None)
+
+        publish.assert_not_called()
+        row = self.read_row("ntfy-ack-001")
+        self.assertIsNone(row["sent_at"])
+        self.assertEqual(0, row["send_attempts"])
 
     def test_transient_failure_keeps_sent_at_null(self):
         self.add_row("transient-001", created_at="2026-08-30T00:00:00Z")
