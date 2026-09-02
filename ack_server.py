@@ -9,6 +9,8 @@ from http.server import (
 )
 from pathlib import Path
 
+import fcm_sender
+
 
 DB_FILE = (
     Path.home()
@@ -19,6 +21,8 @@ DB_FILE = (
 
 HOST = "127.0.0.1"
 PORT = 2587
+
+MAX_PENDING_RECOVERY_ITEMS = 200
 
 
 def now():
@@ -31,6 +35,23 @@ def connect():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def connect_read_only():
+    """Strictly read-only connection used by the recovery endpoint only.
+
+    Opens the same production DB path via a SQLite URI with mode=ro, so SQLite
+    itself rejects any INSERT/UPDATE/DELETE/DDL on this connection.  Unlike
+    connect(), it never executes PRAGMA journal_mode, preserving the DB's
+    existing journal mode.
+    """
+
+    conn = sqlite3.connect(
+        f"file:{DB_FILE}?mode=ro",
+        uri=True,
+    )
+    conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -62,6 +83,10 @@ class Handler(BaseHTTPRequestHandler):
             "application/json; charset=utf-8",
         )
         self.send_header(
+            "Cache-Control",
+            "no-store",
+        )
+        self.send_header(
             "Content-Length",
             str(len(body)),
         )
@@ -79,9 +104,94 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/notifications/pending":
+            self._handle_pending_recovery()
+            return
+
         self.json_response(
             404,
             {"ok": False},
+        )
+
+    def _handle_pending_recovery(self):
+        """Read-only recovery endpoint returning pending notifications as
+        encrypted envelopes.
+
+        Authorization reuses the same Tailscale identity boundary as the
+        ACK endpoint.  No DB mutations occur.
+        """
+
+        tailscale_user = self.headers.get(
+            "Tailscale-User-Login"
+        )
+
+        if not tailscale_user:
+            self.json_response(
+                403,
+                {
+                    "ok": False,
+                    "error": "Tailscale identity required",
+                },
+            )
+            return
+
+        conn = connect_read_only()
+
+        rows = conn.execute(
+            """
+            SELECT n.notification_id,
+                   n.level,
+                   n.title,
+                   n.message,
+                   n.created_at,
+                   n.ack_token
+            FROM notifications n
+            JOIN runs r
+              ON r.run_id = n.run_id
+            WHERE n.canceled_at IS NULL
+              AND n.acknowledged_at IS NULL
+              AND r.status = 'committed'
+            ORDER BY n.created_at ASC,
+                     n.notification_id ASC
+            LIMIT ?
+            """,
+            (MAX_PENDING_RECOVERY_ITEMS + 1,),
+        ).fetchall()
+
+        conn.close()
+
+        if len(rows) > MAX_PENDING_RECOVERY_ITEMS:
+            self.json_response(
+                409,
+                {
+                    "ok": False,
+                    "error": "too_many_pending",
+                },
+            )
+            return
+
+        items = []
+        for row in rows:
+            try:
+                envelope = fcm_sender.build_envelope(row)
+            except Exception:
+                self.json_response(
+                    500,
+                    {
+                        "ok": False,
+                        "error": "internal recovery failure",
+                    },
+                )
+                return
+            items.append(envelope)
+
+        self.json_response(
+            200,
+            {
+                "ok": True,
+                "count": len(items),
+                "items": items,
+            },
         )
 
     def do_POST(self):
