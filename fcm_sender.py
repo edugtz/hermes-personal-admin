@@ -38,6 +38,7 @@ FCM_PRIORITY_BY_LEVEL = {
     "important": "high",
     "urgent": "high",
 }
+FCM_PRIORITIES = frozenset(FCM_PRIORITY_BY_LEVEL.values())
 
 _KID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 _VALID_DETAILS = frozenset(
@@ -257,11 +258,23 @@ def build_message(
     row: Mapping[str, object],
     fid: str,
     key: bytes | None = None,
+    priority_override: str | None = None,
 ) -> messaging.Message:
+    priority = (
+        priority_for_level(row["level"])
+        if priority_override is None
+        else priority_override
+    )
+    if priority not in FCM_PRIORITIES:
+        raise ConfigurationError(
+            "invalid_argument",
+            "FCM priority override is not supported",
+        )
+
     return messaging.Message(
         fid=fid,
         android=messaging.AndroidConfig(
-            priority=priority_for_level(row["level"]),
+            priority=priority,
         ),
         data=build_envelope(row, key),
     )
@@ -368,13 +381,14 @@ def send_notification(
     fid_file: str | os.PathLike[str] | None = None,
     key_file: str | os.PathLike[str] | None = None,
     credential_file: str | os.PathLike[str] | None = None,
+    priority_override: str | None = None,
 ) -> TransportResult:
     """Perform one encrypted FCM send and return a sanitized result."""
 
     try:
         fid = load_fid_file(fid_file)
         key = load_key_file(key_file)
-        message = build_message(row, fid, key)
+        message = build_message(row, fid, key, priority_override)
         initialize_firebase(credential_file)
         response = messaging.send(message)
     except Exception as exc:
