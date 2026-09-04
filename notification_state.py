@@ -9,7 +9,8 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import fcm_sender
@@ -34,10 +35,52 @@ PRIORITIES = {
 
 ACTIVE_TRANSPORT = "fcm"
 SUPPORTED_TRANSPORTS = frozenset({"ntfy", "fcm"})
+INITIAL = "initial"
+REDELIVERY = "redelivery"
+REDELIVERY_WINDOW = timedelta(hours=6)
+REDELIVERY_MINIMUM_GAP = timedelta(hours=2)
+
+
+@dataclass(frozen=True)
+class DispatchCandidate:
+    row: sqlite3.Row
+    mode: str
 
 
 def now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def parse_utc_timestamp(value):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def redelivery_is_eligible(row, dispatch_time):
+    sent_at = parse_utc_timestamp(row["sent_at"])
+    last_attempt_at = parse_utc_timestamp(row["last_attempt_at"])
+    if sent_at is None or last_attempt_at is None:
+        return False
+
+    sent_elapsed = dispatch_time - sent_at
+    attempt_elapsed = dispatch_time - last_attempt_at
+    return (
+        timedelta() <= sent_elapsed <= REDELIVERY_WINDOW
+        and attempt_elapsed >= REDELIVERY_MINIMUM_GAP
+    )
 
 
 def fail(message):
@@ -289,19 +332,20 @@ def validate_active_transport():
         raise ValueError("unsupported active transport")
 
 
-def send_transport(row):
+def send_transport(row, *, priority_override=None):
     validate_active_transport()
     if ACTIVE_TRANSPORT == "ntfy":
         return publish(row)
-    return fcm_sender.send_notification(row)
+    if priority_override is None:
+        return fcm_sender.send_notification(row)
+    return fcm_sender.send_notification(
+        row,
+        priority_override=priority_override,
+    )
 
 
-def cmd_dispatch(args):
-    validate_active_transport()
-    conn = connect()
-    init_db(conn)
-
-    rows = conn.execute(
+def dispatch_candidates(conn, dispatch_time):
+    initial_rows = conn.execute(
         """
         SELECT n.*
         FROM notifications n
@@ -315,14 +359,59 @@ def cmd_dispatch(args):
         """
     ).fetchall()
 
+    candidates = [
+        DispatchCandidate(row, INITIAL)
+        for row in initial_rows
+    ]
+
+    if ACTIVE_TRANSPORT != "fcm":
+        return candidates
+
+    redelivery_rows = conn.execute(
+        """
+        SELECT n.*
+        FROM notifications n
+        JOIN runs r
+          ON r.run_id = n.run_id
+        WHERE n.sent_at IS NOT NULL
+          AND n.canceled_at IS NULL
+          AND n.acknowledged_at IS NULL
+          AND r.status = 'committed'
+        ORDER BY n.created_at
+        """
+    ).fetchall()
+
+    candidates.extend(
+        DispatchCandidate(row, REDELIVERY)
+        for row in redelivery_rows
+        if redelivery_is_eligible(row, dispatch_time)
+    )
+    return candidates
+
+
+def cmd_dispatch(args):
+    validate_active_transport()
+    conn = connect()
+    init_db(conn)
+
+    candidates = dispatch_candidates(conn, utc_now())
+
     sent = 0
     failed = 0
 
-    for row in rows:
+    for candidate in candidates:
+        row = candidate.row
         attempt_time = now()
 
         try:
-            result = send_transport(row)
+            result = send_transport(
+                row,
+                priority_override=(
+                    "normal"
+                    if candidate.mode == REDELIVERY
+                    else None
+                ),
+            )
 
             if ACTIVE_TRANSPORT == "fcm":
                 if not result.accepted:
@@ -345,21 +434,36 @@ def cmd_dispatch(args):
                     failed += 1
                     continue
 
-                conn.execute(
-                    """
-                    UPDATE notifications
-                    SET sent_at = ?,
-                        send_attempts = send_attempts + 1,
-                        last_attempt_at = ?,
-                        last_error = NULL
-                    WHERE notification_id = ?
-                    """,
-                    (
-                        now(),
-                        attempt_time,
-                        row["notification_id"],
-                    ),
-                )
+                if candidate.mode == INITIAL:
+                    conn.execute(
+                        """
+                        UPDATE notifications
+                        SET sent_at = ?,
+                            send_attempts = send_attempts + 1,
+                            last_attempt_at = ?,
+                            last_error = NULL
+                        WHERE notification_id = ?
+                        """,
+                        (
+                            now(),
+                            attempt_time,
+                            row["notification_id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE notifications
+                        SET send_attempts = send_attempts + 1,
+                            last_attempt_at = ?,
+                            last_error = NULL
+                        WHERE notification_id = ?
+                        """,
+                        (
+                            attempt_time,
+                            row["notification_id"],
+                        ),
+                    )
             else:
                 conn.execute(
                     """
@@ -409,7 +513,7 @@ def cmd_dispatch(args):
         json.dumps(
             {
                 "ok": failed == 0,
-                "eligible": len(rows),
+                "eligible": len(candidates),
                 "sent": sent,
                 "failed": failed,
             },

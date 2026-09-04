@@ -3,9 +3,10 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import fcm_sender
 import notification_state
@@ -93,6 +94,16 @@ class FcmSenderTest(unittest.TestCase):
         self.assertEqual("normal", fcm_sender.priority_for_level("remember"))
         self.assertEqual("high", fcm_sender.priority_for_level("important"))
         self.assertEqual("high", fcm_sender.priority_for_level("urgent"))
+
+    def test_normal_priority_override_is_available_for_redelivery_only(self):
+        message = fcm_sender.build_message(
+            self.row,
+            "test-fid-0001",
+            self.key,
+            priority_override="normal",
+        )
+
+        self.assertEqual("normal", message.android.priority)
 
     def test_oversize_payload_rejected_before_firebase_send(self):
         oversized = dict(self.row, message="x" * 3_000)
@@ -258,7 +269,11 @@ class DispatcherTest(unittest.TestCase):
         notification_id,
         *,
         created_at,
+        run_id="run-001",
+        level="important",
+        sent_at=None,
         acknowledged_at=None,
+        canceled_at=None,
         send_attempts=0,
         last_attempt_at=None,
         last_error=None,
@@ -270,22 +285,24 @@ class DispatcherTest(unittest.TestCase):
             INSERT INTO notifications(
                 notification_id, run_id, dedupe_key, level, title, message,
                 ack_token, ntfy_sequence_id, ntfy_message_id, created_at,
-                acknowledged_at, send_attempts, last_attempt_at,
-                last_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sent_at, acknowledged_at, canceled_at, send_attempts,
+                last_attempt_at, last_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 notification_id,
-                "run-001",
+                run_id,
                 "dedupe-" + notification_id,
-                "important",
+                level,
                 "test title",
                 "test message",
                 "ack-" + notification_id,
                 "seq-" + notification_id,
                 ntfy_message_id,
                 created_at,
+                sent_at,
                 acknowledged_at,
+                canceled_at,
                 send_attempts,
                 last_attempt_at,
                 last_error,
@@ -306,7 +323,7 @@ class DispatcherTest(unittest.TestCase):
     def dispatch_with_results(self, results):
         result_iter = iter(results)
 
-        def fake_send(row):
+        def fake_send(row, **_kwargs):
             return next(result_iter)
 
         with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
@@ -539,6 +556,39 @@ class DispatcherTest(unittest.TestCase):
         self.assertIsNotNone(row["sent_at"])
         self.assertEqual("ntfy-message-001", row["ntfy_message_id"])
 
+    def test_ntfy_rollback_does_not_redeliver_already_sent_row(self):
+        sent_at = "2026-09-01T00:00:00Z"
+        last_attempt_at = "2026-09-01T04:00:00Z"
+        self.add_row(
+            "ntfy-sent-no-redelivery-001",
+            created_at=sent_at,
+            sent_at=sent_at,
+            last_attempt_at=last_attempt_at,
+            send_attempts=1,
+        )
+
+        # Same row shape as the FCM redelivery tests: sent_at exactly 6h
+        # before dispatch, last_attempt_at exactly 2h before dispatch.
+        # Under fcm this row IS redelivered (priority normal); under ntfy
+        # it must be left completely untouched.
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
+        ):
+            with patch.object(notification_state, "ACTIVE_TRANSPORT", "ntfy"):
+                with patch.object(notification_state, "publish") as publish:
+                    with patch.object(fcm_sender, "send_notification") as send:
+                        notification_state.cmd_dispatch(None)
+
+        publish.assert_not_called()
+        send.assert_not_called()
+        row = self.read_row("ntfy-sent-no-redelivery-001")
+        self.assertEqual(sent_at, row["sent_at"])
+        self.assertEqual(1, row["send_attempts"])
+        self.assertEqual(last_attempt_at, row["last_attempt_at"])
+        self.assertIsNone(row["last_error"])
+
     def test_unsupported_active_transport_is_rejected(self):
         with patch.object(notification_state, "ACTIVE_TRANSPORT", "unsupported"):
             with self.assertRaisesRegex(ValueError, "unsupported active transport"):
@@ -559,6 +609,165 @@ class DispatcherTest(unittest.TestCase):
         row = self.read_row("unexpected-001")
         self.assertEqual("FCM_UNKNOWN:unknown", row["last_error"])
         self.assertNotIn("private", row["last_error"])
+
+    def test_redelivery_just_under_two_hours_since_attempt_is_not_dispatched(self):
+        self.add_row(
+            "redelivery-too-soon-001",
+            created_at="2026-09-01T00:00:00Z",
+            sent_at="2026-09-01T00:00:00Z",
+            last_attempt_at="2026-09-01T04:00:01Z",
+            send_attempts=1,
+        )
+
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
+        ):
+            with patch.object(fcm_sender, "send_notification") as send:
+                notification_state.cmd_dispatch(None)
+
+        send.assert_not_called()
+        self.assertEqual(1, self.read_row("redelivery-too-soon-001")["send_attempts"])
+
+    def test_redelivery_exactly_two_hours_uses_normal_priority_and_preserves_sent_at(self):
+        sent_at = "2026-09-01T00:00:00Z"
+        self.add_row(
+            "redelivery-exact-gap-001",
+            created_at=sent_at,
+            level="important",
+            sent_at=sent_at,
+            last_attempt_at="2026-09-01T04:00:00Z",
+            send_attempts=1,
+            last_error="FCM_TRANSIENT:network",
+        )
+
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
+        ):
+            with patch.object(
+                fcm_sender,
+                "send_notification",
+                return_value=fcm_sender.TransportResult(True, "accepted"),
+            ) as send:
+                notification_state.cmd_dispatch(None)
+
+        send.assert_called_once_with(
+            ANY,
+            priority_override="normal",
+        )
+        self.assertEqual(
+            "redelivery-exact-gap-001",
+            send.call_args.args[0]["notification_id"],
+        )
+        row = self.read_row("redelivery-exact-gap-001")
+        self.assertEqual(sent_at, row["sent_at"])
+        self.assertEqual(2, row["send_attempts"])
+        self.assertIsNotNone(row["last_attempt_at"])
+        self.assertNotEqual("2026-09-01T04:00:00Z", row["last_attempt_at"])
+        self.assertIsNone(row["last_error"])
+
+    def test_redelivery_exactly_six_hours_since_first_send_is_dispatched(self):
+        self.add_row(
+            "redelivery-exact-window-001",
+            created_at="2026-09-01T00:00:00Z",
+            level="urgent",
+            sent_at="2026-09-01T00:00:00Z",
+            last_attempt_at="2026-09-01T04:00:00Z",
+            send_attempts=1,
+        )
+
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
+        ):
+            with patch.object(
+                fcm_sender,
+                "send_notification",
+                return_value=fcm_sender.TransportResult(True, "accepted"),
+            ) as send:
+                notification_state.cmd_dispatch(None)
+
+        send.assert_called_once_with(
+            ANY,
+            priority_override="normal",
+        )
+        self.assertEqual(2, self.read_row("redelivery-exact-window-001")["send_attempts"])
+
+    def test_redelivery_failure_preserves_sent_at_and_records_sanitized_error(self):
+        sent_at = "2026-09-01T00:00:00Z"
+        self.add_row(
+            "redelivery-failure-001",
+            created_at=sent_at,
+            sent_at=sent_at,
+            last_attempt_at="2026-09-01T04:00:00Z",
+            send_attempts=1,
+        )
+
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
+        ):
+            self.dispatch_with_results(
+                [fcm_sender.TransportResult(False, "transient", "network")]
+            )
+
+        row = self.read_row("redelivery-failure-001")
+        self.assertEqual(sent_at, row["sent_at"])
+        self.assertEqual(2, row["send_attempts"])
+        self.assertEqual("FCM_TRANSIENT:network", row["last_error"])
+
+    def test_redelivery_excludes_acknowledged_canceled_non_committed_and_expired_rows(self):
+        common = {
+            "created_at": "2026-09-01T00:00:00Z",
+            "sent_at": "2026-09-01T00:00:00Z",
+            "last_attempt_at": "2026-09-01T04:00:00Z",
+            "send_attempts": 1,
+        }
+        self.add_row(
+            "redelivery-acknowledged-001",
+            acknowledged_at="2026-09-01T01:00:00Z",
+            **common,
+        )
+        self.add_row(
+            "redelivery-canceled-001",
+            canceled_at="2026-09-01T01:00:00Z",
+            **common,
+        )
+        self.add_row("redelivery-expired-001", **common)
+        conn = notification_state.connect()
+        conn.execute(
+            "INSERT INTO runs(run_id, status) VALUES (?, ?)",
+            ("run-002", "pending"),
+        )
+        conn.commit()
+        conn.close()
+        self.add_row(
+            "redelivery-noncommitted-001",
+            run_id="run-002",
+            **common,
+        )
+
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 1, tzinfo=timezone.utc),
+        ):
+            with patch.object(fcm_sender, "send_notification") as send:
+                notification_state.cmd_dispatch(None)
+
+        send.assert_not_called()
+        for notification_id in (
+            "redelivery-acknowledged-001",
+            "redelivery-canceled-001",
+            "redelivery-expired-001",
+            "redelivery-noncommitted-001",
+        ):
+            self.assertEqual(1, self.read_row(notification_id)["send_attempts"])
 
 
 if __name__ == "__main__":
