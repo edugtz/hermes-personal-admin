@@ -604,6 +604,16 @@ def cmd_pending(args):
 
 
 def cmd_pairing_begin(args):
+    qr_mode = getattr(args, "qr", False)
+    if qr_mode:
+        try:
+            import pairing_qr
+
+            endpoint = pairing_qr.claim_endpoint(ACK_BASE_URL)
+        except Exception:
+            fail("QR setup failed; check the HTTPS ACK URL and QR dependency.")
+            return
+
     try:
         session = pairing_sessions.issue_session(
             intent="replace" if args.replace else "fresh",
@@ -611,6 +621,14 @@ def cmd_pairing_begin(args):
         )
     except ValueError as exc:
         fail(str(exc))
+        return
+
+    if qr_mode:
+        try:
+            pairing_qr.render_pairing(session, endpoint, sys.stdout)
+        except Exception:
+            # Encoder/output exceptions may contain the sensitive payload.
+            fail("QR output failed; generate a new QR when ready.")
         return
 
     # The bearer token is printed exactly once to stdout. It is never
@@ -684,6 +702,11 @@ def main():
     p.set_defaults(func=cmd_pending)
 
     p = sub.add_parser("pairing-begin")
+    p.add_argument(
+        "--qr",
+        action="store_true",
+        help="show a sensitive, ephemeral terminal QR and pairing instructions",
+    )
     p.add_argument("--replace", action="store_true")
     p.add_argument(
         "--ttl-minutes",

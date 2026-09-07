@@ -1,0 +1,5 @@
+# Direct runtime imports only; existing dependencies retain repo-venv versions.
+cryptography==50.0.1
+firebase-admin==7.5.0
+requests==2.34.2
+segno==1.6.6
