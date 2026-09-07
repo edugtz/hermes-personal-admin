@@ -102,6 +102,42 @@ def load_key_file(path: str | os.PathLike[str] | None = None) -> bytes:
     return key
 
 
+FID_MAX_LENGTH = 512
+
+
+def validate_fid_candidate(fid: object) -> str:
+    """Validate one candidate FID with the same strictness as the file loader.
+
+    This is the single shared predicate used by both the reader
+    (``load_fid_file``) and the pairing-claim writer, so the two can never
+    disagree about what counts as a well-formed FID. The character set is
+    deliberately permissive (visible non-whitespace ASCII) to avoid
+    overfitting Firebase's undocumented token format.
+    """
+
+    if not isinstance(fid, str):
+        raise ConfigurationError(
+            "invalid_argument",
+            "FCM FID must be a single non-empty line",
+        )
+    if not fid or fid != fid.strip():
+        raise ConfigurationError(
+            "invalid_argument",
+            "FCM FID must be a single non-empty line",
+        )
+    if len(fid) > FID_MAX_LENGTH:
+        raise ConfigurationError(
+            "invalid_argument",
+            "FCM FID exceeds maximum length",
+        )
+    if any(ord(char) < 0x21 or ord(char) > 0x7E for char in fid):
+        raise ConfigurationError(
+            "invalid_argument",
+            "FCM FID contains unsupported characters",
+        )
+    return fid
+
+
 def load_fid_file(path: str | os.PathLike[str] | None = None) -> str:
     """Read exactly one non-empty FID line, stripping only line endings."""
 
@@ -120,7 +156,7 @@ def load_fid_file(path: str | os.PathLike[str] | None = None) -> str:
             "invalid_argument",
             "FCM FID file must contain exactly one non-empty line",
         )
-    return lines[0]
+    return validate_fid_candidate(lines[0])
 
 
 def validate_kid(kid: str) -> str:

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import fcm_sender
+import pairing_sessions
 
 
 BASE = Path.home() / ".hermes" / "personal-admin"
@@ -602,6 +603,51 @@ def cmd_pending(args):
     )
 
 
+def cmd_pairing_begin(args):
+    try:
+        session = pairing_sessions.issue_session(
+            intent="replace" if args.replace else "fresh",
+            ttl_minutes=args.ttl_minutes,
+        )
+    except ValueError as exc:
+        fail(str(exc))
+        return
+
+    # The bearer token is printed exactly once to stdout. It is never
+    # logged, never written to stderr, and never persisted.
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "session_id": session["session_id"],
+                "intent": session["intent"],
+                "created_at": session["created_at"],
+                "expires_at": session["expires_at"],
+                "ttl_seconds": session["ttl_seconds"],
+                "claim_path": "/pairing/claim",
+                "token": session["token"],
+            },
+            indent=2,
+        )
+    )
+
+
+def cmd_pairing_revoke(args):
+    if pairing_sessions.revoke_session(args.session_id):
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "session_id": args.session_id,
+                    "revoked": True,
+                },
+                indent=2,
+            )
+        )
+    else:
+        fail("unknown pairing session")
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -636,6 +682,19 @@ def main():
 
     p = sub.add_parser("pending")
     p.set_defaults(func=cmd_pending)
+
+    p = sub.add_parser("pairing-begin")
+    p.add_argument("--replace", action="store_true")
+    p.add_argument(
+        "--ttl-minutes",
+        type=int,
+        default=pairing_sessions.DEFAULT_TTL_MINUTES,
+    )
+    p.set_defaults(func=cmd_pairing_begin)
+
+    p = sub.add_parser("pairing-revoke")
+    p.add_argument("session_id")
+    p.set_defaults(func=cmd_pairing_revoke)
 
     args = parser.parse_args()
     args.func(args)
