@@ -13,11 +13,9 @@ pairing_sessions.db-wal
 pairing_sessions.db-shm
 pairing_sessions.db-*
 
-ntfy/publisher_token
 
 # Local/runtime Hermes state
 .venv-py39-backup/
 *.pid
 google/
 logs/
-ntfy/
