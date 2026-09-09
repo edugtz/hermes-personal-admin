@@ -6,8 +6,6 @@ import json
 import secrets
 import sqlite3
 import sys
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -19,23 +17,11 @@ import pairing_sessions
 
 BASE = Path.home() / ".hermes" / "personal-admin"
 DB_FILE = BASE / "personal_admin.db"
-TOKEN_FILE = BASE / "ntfy" / "publisher_token"
-
-NTFY_URL = "http://127.0.0.1:2586/"
-TOPIC = "personal-admin"
 
 ACK_BASE_URL = (
     "https://macbook-pro-de-eduardo.taildc9db9.ts.net:8443"
 )
 
-PRIORITIES = {
-    "remember": 3,
-    "important": 4,
-    "urgent": 5,
-}
-
-ACTIVE_TRANSPORT = "fcm"
-SUPPORTED_TRANSPORTS = frozenset({"ntfy", "fcm"})
 INITIAL = "initial"
 REDELIVERY = "redelivery"
 REDELIVERY_WINDOW = timedelta(hours=6)
@@ -117,6 +103,9 @@ def init_db(conn):
             message TEXT NOT NULL,
 
             ack_token TEXT NOT NULL UNIQUE,
+            -- LEGACY SCHEMA COMPATIBILITY ONLY: existing production DB
+            -- requires ntfy_sequence_id NOT NULL. Inert; no transport
+            -- meaning; never read. ntfy_message_id is never written.
             ntfy_sequence_id TEXT NOT NULL UNIQUE,
             ntfy_message_id TEXT,
 
@@ -227,8 +216,10 @@ def cmd_queue(args):
     notification_id = uuid.uuid4().hex
     ack_token = secrets.token_urlsafe(32)
 
-    # Stable ID used on ntfy retries.
-    sequence_id = "pa-" + notification_id[:24]
+    # LEGACY SCHEMA COMPATIBILITY ONLY:
+    # existing production DB requires ntfy_sequence_id NOT NULL.
+    # This value has no transport meaning and is never read.
+    legacy_sequence_id = "pa-" + notification_id[:24]
 
     conn.execute(
         """
@@ -253,7 +244,7 @@ def cmd_queue(args):
             args.title,
             args.message,
             ack_token,
-            sequence_id,
+            legacy_sequence_id,
             now(),
         ),
     )
@@ -270,78 +261,6 @@ def cmd_queue(args):
             },
             indent=2,
         )
-    )
-
-
-def publish(row):
-    if not TOKEN_FILE.exists():
-        raise RuntimeError("publisher_token missing")
-
-    token = TOKEN_FILE.read_text(
-        encoding="utf-8"
-    ).strip()
-
-    ack_url = (
-        f"{ACK_BASE_URL}/ack/"
-        f"{row['notification_id']}"
-    )
-
-    payload = {
-        "topic": TOPIC,
-        "title": row["title"],
-        "message": row["message"],
-        "priority": PRIORITIES[row["level"]],
-        "sequence_id": row["ntfy_sequence_id"],
-        "actions": [
-            {
-                "action": "http",
-                "label": "Visto",
-                "url": ack_url,
-                "method": "POST",
-                "headers": {
-                    "X-Ack-Token": row["ack_token"],
-                },
-                "clear": True,
-            }
-        ],
-    }
-
-    request = urllib.request.Request(
-        NTFY_URL,
-        data=json.dumps(
-            payload,
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    with urllib.request.urlopen(
-        request,
-        timeout=10,
-    ) as response:
-        return json.loads(
-            response.read().decode("utf-8")
-        )
-
-
-def validate_active_transport():
-    if ACTIVE_TRANSPORT not in SUPPORTED_TRANSPORTS:
-        raise ValueError("unsupported active transport")
-
-
-def send_transport(row, *, priority_override=None):
-    validate_active_transport()
-    if ACTIVE_TRANSPORT == "ntfy":
-        return publish(row)
-    if priority_override is None:
-        return fcm_sender.send_notification(row)
-    return fcm_sender.send_notification(
-        row,
-        priority_override=priority_override,
     )
 
 
@@ -364,9 +283,6 @@ def dispatch_candidates(conn, dispatch_time):
         DispatchCandidate(row, INITIAL)
         for row in initial_rows
     ]
-
-    if ACTIVE_TRANSPORT != "fcm":
-        return candidates
 
     redelivery_rows = conn.execute(
         """
@@ -391,7 +307,6 @@ def dispatch_candidates(conn, dispatch_time):
 
 
 def cmd_dispatch(args):
-    validate_active_transport()
     conn = connect()
     init_db(conn)
 
@@ -405,72 +320,39 @@ def cmd_dispatch(args):
         attempt_time = now()
 
         try:
-            result = send_transport(
-                row,
-                priority_override=(
-                    "normal"
-                    if candidate.mode == REDELIVERY
-                    else None
-                ),
-            )
-
-            if ACTIVE_TRANSPORT == "fcm":
-                if not result.accepted:
-                    conn.execute(
-                        """
-                        UPDATE notifications
-                        SET send_attempts = send_attempts + 1,
-                            last_attempt_at = ?,
-                            last_error = ?
-                        WHERE notification_id = ?
-                        """,
-                        (
-                            attempt_time,
-                            fcm_sender.sanitized_error_marker(result)
-                            or "FCM_UNKNOWN:unknown",
-                            row["notification_id"],
-                        ),
-                    )
-                    conn.commit()
-                    failed += 1
-                    continue
-
-                if candidate.mode == INITIAL:
-                    conn.execute(
-                        """
-                        UPDATE notifications
-                        SET sent_at = ?,
-                            send_attempts = send_attempts + 1,
-                            last_attempt_at = ?,
-                            last_error = NULL
-                        WHERE notification_id = ?
-                        """,
-                        (
-                            now(),
-                            attempt_time,
-                            row["notification_id"],
-                        ),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        UPDATE notifications
-                        SET send_attempts = send_attempts + 1,
-                            last_attempt_at = ?,
-                            last_error = NULL
-                        WHERE notification_id = ?
-                        """,
-                        (
-                            attempt_time,
-                            row["notification_id"],
-                        ),
-                    )
+            if candidate.mode == REDELIVERY:
+                result = fcm_sender.send_notification(
+                    row,
+                    priority_override="normal",
+                )
             else:
+                result = fcm_sender.send_notification(row)
+
+            if not result.accepted:
+                conn.execute(
+                    """
+                    UPDATE notifications
+                    SET send_attempts = send_attempts + 1,
+                        last_attempt_at = ?,
+                        last_error = ?
+                    WHERE notification_id = ?
+                    """,
+                    (
+                        attempt_time,
+                        fcm_sender.sanitized_error_marker(result)
+                        or "FCM_UNKNOWN:unknown",
+                        row["notification_id"],
+                    ),
+                )
+                conn.commit()
+                failed += 1
+                continue
+
+            if candidate.mode == INITIAL:
                 conn.execute(
                     """
                     UPDATE notifications
                     SET sent_at = ?,
-                        ntfy_message_id = ?,
                         send_attempts = send_attempts + 1,
                         last_attempt_at = ?,
                         last_error = NULL
@@ -478,7 +360,20 @@ def cmd_dispatch(args):
                     """,
                     (
                         now(),
-                        result.get("id"),
+                        attempt_time,
+                        row["notification_id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE notifications
+                    SET send_attempts = send_attempts + 1,
+                        last_attempt_at = ?,
+                        last_error = NULL
+                    WHERE notification_id = ?
+                    """,
+                    (
                         attempt_time,
                         row["notification_id"],
                     ),
@@ -487,7 +382,7 @@ def cmd_dispatch(args):
             conn.commit()
             sent += 1
 
-        except Exception as exc:
+        except Exception:
             conn.execute(
                 """
                 UPDATE notifications
@@ -498,11 +393,7 @@ def cmd_dispatch(args):
                 """,
                 (
                     attempt_time,
-                    (
-                        "FCM_UNKNOWN:unknown"
-                        if ACTIVE_TRANSPORT == "fcm"
-                        else str(exc)[:2000]
-                    ),
+                    "FCM_UNKNOWN:unknown",
                     row["notification_id"],
                 ),
             )

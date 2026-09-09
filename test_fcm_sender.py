@@ -279,6 +279,9 @@ class DispatcherTest(unittest.TestCase):
         last_error=None,
         ntfy_message_id=None,
     ):
+        # LEGACY SCHEMA COMPATIBILITY ONLY: ntfy_* columns mirror the
+        # existing production NOT NULL schema. ntfy_sequence_id is inert
+        # compat; ntfy_message_id must stay NULL (never written by dispatch).
         conn = notification_state.connect()
         conn.execute(
             """
@@ -326,15 +329,14 @@ class DispatcherTest(unittest.TestCase):
         def fake_send(row, **_kwargs):
             return next(result_iter)
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
-            with patch.object(fcm_sender, "send_notification", side_effect=fake_send):
-                try:
-                    notification_state.cmd_dispatch(None)
-                except SystemExit as exit_context:
-                    return exit_context.code
+        with patch.object(fcm_sender, "send_notification", side_effect=fake_send):
+            try:
+                notification_state.cmd_dispatch(None)
+            except SystemExit as exit_context:
+                return exit_context.code
         return 0
 
-    def test_accepted_sets_sent_after_sender_result_and_leaves_ntfy_id_untouched(self):
+    def test_accepted_sets_sent_and_never_writes_legacy_message_id(self):
         self.add_row("accepted-001", created_at="2026-08-30T00:00:00Z")
         observed_before_return = []
 
@@ -346,9 +348,8 @@ class DispatcherTest(unittest.TestCase):
                 message_id="fcm-message-id-not-stored",
             )
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
-            with patch.object(fcm_sender, "send_notification", side_effect=fake_send):
-                notification_state.cmd_dispatch(None)
+        with patch.object(fcm_sender, "send_notification", side_effect=fake_send):
+            notification_state.cmd_dispatch(None)
 
         row = self.read_row("accepted-001")
         self.assertEqual([None], observed_before_return)
@@ -356,7 +357,10 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(1, row["send_attempts"])
         self.assertIsNotNone(row["last_attempt_at"])
         self.assertIsNone(row["last_error"])
+        # Legacy compat: ntfy_message_id is never written; the inert
+        # ntfy_sequence_id fixture value passes through untouched.
         self.assertIsNone(row["ntfy_message_id"])
+        self.assertEqual("seq-accepted-001", row["ntfy_sequence_id"])
 
     def test_acknowledged_unsent_committed_row_is_not_dispatched(self):
         self.add_row(
@@ -368,9 +372,8 @@ class DispatcherTest(unittest.TestCase):
             last_error=None,
         )
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
-            with patch.object(fcm_sender, "send_notification") as send:
-                notification_state.cmd_dispatch(None)
+        with patch.object(fcm_sender, "send_notification") as send:
+            notification_state.cmd_dispatch(None)
 
         send.assert_not_called()
         row = self.read_row("ack-unsent-001")
@@ -392,13 +395,12 @@ class DispatcherTest(unittest.TestCase):
                 message_id="m-1",
             )
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
-            with patch.object(
-                fcm_sender,
-                "send_notification",
-                side_effect=fake_send,
-            ):
-                notification_state.cmd_dispatch(None)
+        with patch.object(
+            fcm_sender,
+            "send_notification",
+            side_effect=fake_send,
+        ):
+            notification_state.cmd_dispatch(None)
 
         row = self.read_row("unack-unsent-001")
         self.assertEqual(["unack-unsent-001"], observed)
@@ -416,9 +418,8 @@ class DispatcherTest(unittest.TestCase):
             last_error="FCM_TRANSIENT:network",
         )
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
-            with patch.object(fcm_sender, "send_notification") as send:
-                notification_state.cmd_dispatch(None)
+        with patch.object(fcm_sender, "send_notification") as send:
+            notification_state.cmd_dispatch(None)
 
         send.assert_not_called()
         row = self.read_row("ack-failed-001")
@@ -427,22 +428,6 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual("2026-08-30T03:00:00Z", row["last_attempt_at"])
         self.assertEqual("FCM_TRANSIENT:network", row["last_error"])
         self.assertIsNotNone(row["acknowledged_at"])
-
-    def test_ntfy_acknowledged_row_is_not_published(self):
-        self.add_row(
-            "ntfy-ack-001",
-            created_at="2026-08-30T00:00:00Z",
-            acknowledged_at="2026-08-30T01:00:00Z",
-        )
-
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "ntfy"):
-            with patch.object(notification_state, "publish") as publish:
-                notification_state.cmd_dispatch(None)
-
-        publish.assert_not_called()
-        row = self.read_row("ntfy-ack-001")
-        self.assertIsNone(row["sent_at"])
-        self.assertEqual(0, row["send_attempts"])
 
     def test_transient_failure_keeps_sent_at_null(self):
         self.add_row("transient-001", created_at="2026-08-30T00:00:00Z")
@@ -540,71 +525,104 @@ class DispatcherTest(unittest.TestCase):
         self.assertIsNotNone(row["last_attempt_at"])
         self.assertEqual("FCM_TRANSIENT:network", row["last_error"])
 
-    def test_ntfy_path_retains_message_id_behavior(self):
-        self.add_row("ntfy-001", created_at="2026-08-30T00:00:00Z")
+    def test_accepted_and_rejected_paths_never_write_legacy_message_id(self):
+        self.add_row("legacy-null-accept-001", created_at="2026-08-30T00:00:00Z")
+        self.add_row("legacy-null-reject-001", created_at="2026-08-30T00:01:00Z")
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "ntfy"):
-            with patch.object(
-                notification_state,
-                "publish",
-                return_value={"id": "ntfy-message-001"},
-            ) as publish:
-                notification_state.cmd_dispatch(None)
+        exit_code = self.dispatch_with_results(
+            [
+                fcm_sender.TransportResult(True, "accepted"),
+                fcm_sender.TransportResult(False, "transient", "network"),
+            ]
+        )
 
-        row = self.read_row("ntfy-001")
-        publish.assert_called_once()
-        self.assertIsNotNone(row["sent_at"])
-        self.assertEqual("ntfy-message-001", row["ntfy_message_id"])
+        self.assertEqual(2, exit_code)
+        for notification_id in (
+            "legacy-null-accept-001",
+            "legacy-null-reject-001",
+        ):
+            row = self.read_row(notification_id)
+            # Legacy compat column is never written by any runtime path.
+            self.assertIsNone(row["ntfy_message_id"])
+            self.assertEqual("seq-" + notification_id, row["ntfy_sequence_id"])
 
-    def test_ntfy_rollback_does_not_redeliver_already_sent_row(self):
+    def test_sent_row_within_window_is_redelivered_with_normal_priority(self):
         sent_at = "2026-09-01T00:00:00Z"
         last_attempt_at = "2026-09-01T04:00:00Z"
         self.add_row(
-            "ntfy-sent-no-redelivery-001",
+            "redelivery-within-window-001",
             created_at=sent_at,
+            level="urgent",
             sent_at=sent_at,
             last_attempt_at=last_attempt_at,
             send_attempts=1,
         )
 
-        # Same row shape as the FCM redelivery tests: sent_at exactly 6h
-        # before dispatch, last_attempt_at exactly 2h before dispatch.
-        # Under fcm this row IS redelivered (priority normal); under ntfy
-        # it must be left completely untouched.
+        # sent_at exactly 6h before dispatch, last_attempt_at exactly 2h
+        # before dispatch: eligible, so FCM redelivery fires unconditionally
+        # with priority normal and preserves the first sent_at.
         with patch.object(
             notification_state,
             "utc_now",
             return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
         ):
-            with patch.object(notification_state, "ACTIVE_TRANSPORT", "ntfy"):
-                with patch.object(notification_state, "publish") as publish:
-                    with patch.object(fcm_sender, "send_notification") as send:
-                        notification_state.cmd_dispatch(None)
+            with patch.object(
+                fcm_sender,
+                "send_notification",
+                return_value=fcm_sender.TransportResult(True, "accepted"),
+            ) as send:
+                notification_state.cmd_dispatch(None)
 
-        publish.assert_not_called()
-        send.assert_not_called()
-        row = self.read_row("ntfy-sent-no-redelivery-001")
+        send.assert_called_once_with(ANY, priority_override="normal")
+        self.assertEqual(
+            "redelivery-within-window-001",
+            send.call_args.args[0]["notification_id"],
+        )
+        row = self.read_row("redelivery-within-window-001")
         self.assertEqual(sent_at, row["sent_at"])
-        self.assertEqual(1, row["send_attempts"])
-        self.assertEqual(last_attempt_at, row["last_attempt_at"])
+        self.assertEqual(2, row["send_attempts"])
         self.assertIsNone(row["last_error"])
+        self.assertIsNone(row["ntfy_message_id"])
 
-    def test_unsupported_active_transport_is_rejected(self):
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "unsupported"):
-            with self.assertRaisesRegex(ValueError, "unsupported active transport"):
-                notification_state.validate_active_transport()
+    def test_legacy_sequence_id_is_preserved_untouched_by_redelivery(self):
+        sent_at = "2026-09-01T00:00:00Z"
+        self.add_row(
+            "legacy-seq-redelivery-001",
+            created_at=sent_at,
+            sent_at=sent_at,
+            last_attempt_at="2026-09-01T04:00:00Z",
+            send_attempts=1,
+        )
+
+        with patch.object(
+            notification_state,
+            "utc_now",
+            return_value=datetime(2026, 9, 1, 6, 0, 0, tzinfo=timezone.utc),
+        ):
+            self.dispatch_with_results(
+                [fcm_sender.TransportResult(False, "transient", "network")]
+            )
+
+        row = self.read_row("legacy-seq-redelivery-001")
+        self.assertEqual(sent_at, row["sent_at"])
+        self.assertEqual(2, row["send_attempts"])
+        self.assertEqual("FCM_TRANSIENT:network", row["last_error"])
+        # Inert compat value survives redelivery untouched.
+        self.assertEqual(
+            "seq-legacy-seq-redelivery-001", row["ntfy_sequence_id"]
+        )
+        self.assertIsNone(row["ntfy_message_id"])
 
     def test_unexpected_fcm_exception_is_not_persisted_raw(self):
         self.add_row("unexpected-001", created_at="2026-08-30T00:00:00Z")
 
-        with patch.object(notification_state, "ACTIVE_TRANSPORT", "fcm"):
-            with patch.object(
-                fcm_sender,
-                "send_notification",
-                side_effect=RuntimeError("private title private message private token"),
-            ):
-                with self.assertRaises(SystemExit):
-                    notification_state.cmd_dispatch(None)
+        with patch.object(
+            fcm_sender,
+            "send_notification",
+            side_effect=RuntimeError("private title private message private token"),
+        ):
+            with self.assertRaises(SystemExit):
+                notification_state.cmd_dispatch(None)
 
         row = self.read_row("unexpected-001")
         self.assertEqual("FCM_UNKNOWN:unknown", row["last_error"])
