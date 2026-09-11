@@ -3,3 +3,4 @@ cryptography==50.0.1
 firebase-admin==7.5.0
 requests==2.34.2
 segno==1.6.6
+google-api-python-client==2.199.0
