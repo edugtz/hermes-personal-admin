@@ -57,9 +57,15 @@ class PairingClaimTest(unittest.TestCase):
             "load_key_file",
             lambda path=None: TEST_KEY,
         )
+        self.ack_url_patch = patch.object(
+            ack_server,
+            "ACK_BASE_URL",
+            "https://hermes.example:8443",
+        )
         self.pairing_db_patch.start()
         self.fid_patch.start()
         self.key_patch.start()
+        self.ack_url_patch.start()
         ack_server._claim_rate_limiter.reset()
 
         self.server = _ReusableHTTPServer(
@@ -76,6 +82,7 @@ class PairingClaimTest(unittest.TestCase):
         self.server.server_close()
         self.server_thread.join(timeout=5.0)
         ack_server._claim_rate_limiter.reset()
+        self.ack_url_patch.stop()
         self.key_patch.stop()
         self.fid_patch.stop()
         self.pairing_db_patch.stop()

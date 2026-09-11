@@ -1,8 +1,9 @@
-#!/Users/eduardo/.hermes/personal-admin/.venv/bin/python
+#!/usr/bin/env python3
 
 import argparse
 import hashlib
 import json
+import os
 import secrets
 import sqlite3
 import sys
@@ -18,9 +19,7 @@ import pairing_sessions
 BASE = Path.home() / ".hermes" / "personal-admin"
 DB_FILE = BASE / "personal_admin.db"
 
-ACK_BASE_URL = (
-    "https://macbook-pro-de-eduardo.taildc9db9.ts.net:8443"
-)
+ACK_BASE_URL = os.environ.get("ACK_BASE_URL", "").strip()
 
 INITIAL = "initial"
 REDELIVERY = "redelivery"

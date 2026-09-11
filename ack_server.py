@@ -1,4 +1,4 @@
-#!/Users/eduardo/.hermes/personal-admin/.venv/bin/python
+#!/usr/bin/env python3
 
 import base64
 import contextlib
