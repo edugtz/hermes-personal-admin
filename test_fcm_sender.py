@@ -53,6 +53,81 @@ class FcmSenderTest(unittest.TestCase):
         )
         self.assertTrue(all(isinstance(value, str) for value in payload.values()))
 
+    def test_message_file_round_trips_through_queue_and_fcm_payload(self):
+        message = (
+            "Requiere acción\n"
+            "• Retiro de $5,500 MXN\n"
+            "• Texto con \"comillas\"\n"
+            "• áéíóú ñ\n"
+            "\n"
+            "Próximos compromisos\n"
+            "• Evento de prueba"
+        )
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute(
+            """
+            CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO runs(run_id, status) VALUES (?, ?)",
+            ("test-run", "pending"),
+        )
+        conn.commit()
+
+        with tempfile.TemporaryDirectory() as directory:
+            message_file = Path(directory) / "message.txt"
+            message_file.write_bytes(
+                message.encode("utf-8")
+            )
+
+            args = SimpleNamespace(
+                run_id="test-run",
+                level="important",
+                title="Personal Admin",
+                message=None,
+                message_file=str(message_file),
+            )
+
+            with patch.object(
+                notification_state,
+                "connect",
+                return_value=conn,
+            ):
+                notification_state.cmd_queue(args)
+
+        row = conn.execute(
+            """
+            SELECT notification_id,
+                   level,
+                   title,
+                   message,
+                   created_at,
+                   ack_token
+            FROM notifications
+            WHERE run_id = ?
+            """,
+            ("test-run",),
+        ).fetchone()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(message, row["message"])
+
+        payload = fcm_sender.build_inner_payload(row)
+
+        self.assertEqual(
+            message,
+            payload["message"],
+        )
+
+        conn.close()
+
     def test_deterministic_cross_language_vector(self):
         envelope = fcm_sender._encrypt_with_nonce(
             key=self.key,

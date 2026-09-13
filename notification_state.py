@@ -80,6 +80,23 @@ def fail(message):
     sys.exit(1)
 
 
+def load_queue_message(args):
+    if args.message is not None:
+        return args.message
+
+    try:
+        return (
+            Path(args.message_file)
+            .read_bytes()
+            .decode("utf-8")
+        )
+    except (OSError, UnicodeDecodeError):
+        fail(
+            "Notification message file could not "
+            "be read as UTF-8"
+        )
+
+
 def connect():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
@@ -174,12 +191,14 @@ def cmd_queue(args):
             f"Run {args.run_id} is not queueable; status={status}"
         )
 
+    message = load_queue_message(args)
+
     material = json.dumps(
         {
             "run_id": args.run_id,
             "level": args.level,
             "title": args.title,
-            "message": args.message,
+            "message": message,
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -241,7 +260,7 @@ def cmd_queue(args):
             dedupe_key,
             args.level,
             args.title,
-            args.message,
+            message,
             ack_token,
             legacy_sequence_id,
             now(),
@@ -579,7 +598,13 @@ def main():
         ],
     )
     p.add_argument("--title", required=True)
-    p.add_argument("--message", required=True)
+
+    message_input = p.add_mutually_exclusive_group(
+        required=True,
+    )
+    message_input.add_argument("--message")
+    message_input.add_argument("--message-file")
+
     p.set_defaults(func=cmd_queue)
 
     p = sub.add_parser("dispatch")
